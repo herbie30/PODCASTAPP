@@ -1,0 +1,254 @@
+```text
+Project: PodcastPlayerApp
+
+/app
+  /src/main
+    /AndroidManifest.xml
+    /java/com/example/podcastplayer
+      PodcastPlayerApp.kt
+      MainActivity.kt
+      PlayerService.kt
+      data/
+        Podcast.kt
+        Episode.kt
+        Bookmark.kt
+        HistoryEntry.kt
+      db/
+        PodcastDao.kt
+        BookmarkDao.kt
+        HistoryDao.kt
+        PodcastDatabase.kt
+      network/
+        PodcastApi.kt
+        RetrofitClient.kt
+      repository/
+        PodcastRepository.kt
+      ui/
+        MainViewModel.kt
+        screens/
+          HomeScreen.kt
+          SearchScreen.kt
+          PlayerScreen.kt
+          HistoryScreen.kt
+          BookmarksScreen.kt
+    /res
+      /layout
+        activity_main.xml
+      /values
+        strings.xml
+        themes.xml
+/build.gradle (Module: app)
+```
+
+```kotlin
+// MainActivity.kt
+package com.example.podcastplayer
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Bundle
+import android.os.IBinder
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.material.MaterialTheme
+import androidx.compose.material.Surface
+import androidx.compose.runtime.*
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.example.podcastplayer.ui.MainViewModel
+import com.example.podcastplayer.ui.screens.*
+import com.google.android.exoplayer2.SimpleExoPlayer
+import dagger.hilt.android.AndroidEntryPoint
+
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+    private var serviceBound by mutableStateOf(false)
+    private lateinit var playerService: PlayerService
+    private lateinit var exoPlayer: SimpleExoPlayer
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val binderService = binder as PlayerService.LocalBinder
+            playerService = binderService.getService()
+            exoPlayer = playerService.exoPlayer
+            serviceBound = true
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBound = false
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Bind to service
+        Intent(this, PlayerService::class.java).also { intent ->
+            bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        }
+
+        setContent {
+            val navController = rememberNavController()
+            val viewModel: MainViewModel = hiltViewModel()
+
+            MaterialTheme {
+                Surface {
+                    NavHost(navController, startDestination = "home") {
+                        composable("home") {
+                            HomeScreen(
+                                podcasts = viewModel.subscriptions.collectAsState().value,
+                                onSelectPodcast = { podcast ->
+                                    viewModel.selectPodcast(podcast)
+                                    navController.navigate("player")
+                                },
+                                onNavigateToSearch = { navController.navigate("search") }
+                            )
+                        }
+                        composable("search") {
+                            SearchScreen(
+                                onSubscribe = { viewModel.subscribe(it) },
+                                viewModel = viewModel
+                            )
+                        }
+                        composable("player") {
+                            PlayerScreen(
+                                player = exoPlayer,
+                                currentEpisode = viewModel.currentEpisode.collectAsState().value,
+                                onSpeedChange = { speed ->
+                                    if (serviceBound) playerService.setPlaybackSpeed(speed)
+                                }
+                            )
+                        }
+                        composable("history") {
+                            HistoryScreen(
+                                history = viewModel.history.collectAsState().value,
+                                onSelectEpisode = { entry ->
+                                    viewModel.playFromHistory(entry)
+                                    navController.navigate("player")
+                                }
+                            )
+                        }
+                        composable("bookmarks") {
+                            BookmarksScreen(
+                                bookmarks = viewModel.bookmarks.collectAsState().value,
+                                onSelectBookmark = { bm ->
+                                    viewModel.playFromBookmark(bm)
+                                    navController.navigate("player")
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (serviceBound) unbindService(connection)
+    }
+}
+```
+
+```kotlin
+// MainViewModel.kt
+package com.example.podcastplayer.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.podcastplayer.data.Bookmark
+import com.example.podcastplayer.data.Episode
+import com.example.podcastplayer.data.HistoryEntry
+import com.example.podcastplayer.data.Podcast
+import com.example.podcastplayer.repository.PodcastRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class MainViewModel @Inject constructor(
+    private val repository: PodcastRepository
+) : ViewModel() {
+    // Subscriptions
+    val subscriptions = repository.subscriptions
+
+    // Search results
+    private val _searchResults = MutableStateFlow<List<Podcast>>(emptyList())
+      val searchResults: StateFlow<List<Podcast>> = _searchResults.asStateFlow()
+
+    fun searchPodcasts(query: String) = viewModelScope.launch {
+        _searchResults.value = repository.searchPodcasts(query)
+    }
+
+    // Selected podcast and its episodes
+    private val _currentEpisodes = MutableStateFlow<List<Episode>>(emptyList())
+    val currentEpisodes: StateFlow<List<Episode>> = _currentEpisodes.asStateFlow()
+
+    private val _currentEpisode = MutableStateFlow<Episode?>(null)
+    val currentEpisode: StateFlow<Episode?> = _currentEpisode.asStateFlow()
+
+    fun selectPodcast(podcast: Podcast) = viewModelScope.launch {
+        repository.subscribe(podcast)
+        _currentEpisodes.value = repository.getEpisodes(podcast.id)
+        playEpisode(_currentEpisodes.value.firstOrNull())
+    }
+
+    fun subscribe(podcast: Podcast) = viewModelScope.launch {
+        repository.subscribe(podcast)
+    }
+
+    // Playback
+    fun playEpisode(episode: Episode?) {
+        episode?.let {
+            _currentEpisode.value = it
+            viewModelScope.launch { repository.insertHistoryEntry(
+                HistoryEntry(0, it.podcastId, it.id, it.title, System.currentTimeMillis())
+            ) }
+            // send to service via event bus or connection callback in Activity
+        }
+    }
+
+    fun playFromHistory(entry: HistoryEntry) = viewModelScope.launch {
+        // Fetch episodes and find entry
+        _currentEpisodes.value = repository.getEpisodes(entry.podcastId)
+        _currentEpisode.value = _currentEpisodes.value.find { it.id == entry.episodeId }
+    }
+
+    fun playFromBookmark(bookmark: Bookmark) = viewModelScope.launch {
+        _currentEpisodes.value = repository.getEpisodes(bookmark.podcastId)
+        _currentEpisode.value = _currentEpisodes.value.find { it.id == bookmark.episodeId }
+    }
+
+    // History
+    private val _history = MutableStateFlow<List<HistoryEntry>>(emptyList())
+      val history: StateFlow<List<HistoryEntry>> = _history.asStateFlow()
+    init {
+        viewModelScope.launch {
+            repository.getAllHistory().collect { _history.value = it }
+        }
+    }
+
+    // Bookmarks
+    private val _bookmarks = MutableStateFlow<List<Bookmark>>(emptyList())
+      val bookmarks: StateFlow<List<Bookmark>> = _bookmarks.asStateFlow()
+    fun loadBookmarks(podcastId: String) = viewModelScope.launch {
+        repository.getBookmarksForPodcast(podcastId).collect { _bookmarks.value = it }
+    }
+
+    fun bookmarkEpisode(bookmark: Bookmark) = viewModelScope.launch {
+        repository.insertBookmark(bookmark)
+    }
+
+    fun removeBookmark(bookmark: Bookmark) = viewModelScope.launch {
+        repository.deleteBookmark(bookmark)
+    }
+}
+```
